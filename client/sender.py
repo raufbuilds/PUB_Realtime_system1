@@ -8,7 +8,7 @@ API_URL = "http://127.0.0.1:8000/ingest"
 
 # Use absolute path or correct relative path
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-csv_path = os.path.join(BASE_DIR, "..", "cleaner", "processed_.csv_file", "PUB_Demand_2024.csv")
+csv_path = os.path.join(BASE_DIR, "..", "cleaner", "processed_.csv_file", "PUB_Demand_2020P.csv")
 
 filename = os.path.basename(csv_path)
 df = pd.read_csv(csv_path)

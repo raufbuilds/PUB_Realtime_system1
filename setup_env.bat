@@ -1,27 +1,25 @@
 @echo off
-echo =====================================
-echo   PUB Realtime System - First Setup
-echo =====================================
+echo ----------------------------------------------
+echo Setting up PUB Realtime System Environment...
+echo ----------------------------------------------
 
-python --version >nul 2>&1
-IF ERRORLEVEL 1 (
-    echo ERROR: Python is not installed or not in PATH
-    pause
-    exit /b
+:: Fix PowerShell execution policy for the current user
+powershell -Command "Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser"
+
+:: Create virtual environment if it doesn't exist
+if not exist venv (
+    echo Creating virtual environment...
+    python -m venv venv
+) else (
+    echo venv already exists. skipping...
 )
 
-echo Creating virtual environment...
-python -m venv venv
+:: Activate and install requirements
+echo Installing dependencies from requirements.txt...
+call venv\Scripts\activate && pip install -r requirements.txt
 
-echo Activating virtual environment...
-call venv\Scripts\activate
-
-echo Installing dependencies...
-pip install --upgrade pip
-pip install -r requirements.txt
-
-echo -------------------------------------
-echo Setup complete.
-echo -------------------------------------
-echo Use start_laptop1.bat or start_laptop2.bat to run.
+echo ----------------------------------------------
+echo SETUP COMPLETE!
+echo You can now run your start_laptop scripts.
+echo ----------------------------------------------
 pause

@@ -1,41 +1,24 @@
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from sse_starlette.sse import EventSourceResponse
-import asyncio
-import json
+import sqlite3
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ডাটাবেস সেটআপ
+def init_db():
+    conn = sqlite3.connect("data.db")
+    curr = conn.cursor()
+    curr.execute("CREATE TABLE IF NOT EXISTS demand (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, hour INTEGER, demand REAL)")
+    conn.commit()
+    conn.close()
 
-latest_data = []
-
+init_db()
 
 @app.post("/ingest")
 async def ingest(data: dict):
-    latest_data.append(data)
-    return JSONResponse({"message": "Data received"})
-
-
-@app.get("/stream")
-async def stream():
-
-    async def event_generator():
-        last_index = 0
-        while True:
-            if last_index < len(latest_data):
-                payload = json.dumps(latest_data[last_index])
-                yield {"data": payload}
-                last_index += 1
-
-            await asyncio.sleep(0.5)  # keepalive rate
-
-    return EventSourceResponse(event_generator())
-
+    conn = sqlite3.connect("data.db")
+    curr = conn.cursor()
+    curr.execute("INSERT INTO demand (date, hour, demand) VALUES (?,?,?)", 
+                 (data.get('Date'), data.get('Hour'), data.get('Ontario Demand')))
+    conn.commit()
+    conn.close()
+    return {"status": "saved"}

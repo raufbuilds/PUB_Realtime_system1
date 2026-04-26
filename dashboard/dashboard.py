@@ -61,6 +61,15 @@ def ensure_state():
         st.session_state.show_normal_rows = False
     if "view_mode" not in st.session_state:
         st.session_state.view_mode = "Today"
+    # Forecast model caching
+    if "prophet_model" not in st.session_state:
+        st.session_state.prophet_model = None
+    if "xgboost_model" not in st.session_state:
+        st.session_state.xgboost_model = None
+    if "forecast_cache_time" not in st.session_state:
+        st.session_state.forecast_cache_time = 0
+    if "forecast_cache_data_hash" not in st.session_state:
+        st.session_state.forecast_cache_data_hash = None
 
 
 def coerce_date_range_value(value):
@@ -304,30 +313,53 @@ def compute_hourly_baseline(df, threshold=3.0):
 def forecast_with_prophet(df, target_date=None):
     """
     Use Prophet to forecast expected demand for each hour of a target date.
+    Uses caching to avoid retraining on every refresh.
     Returns a DataFrame with Hour and Predicted columns.
     """
+    import hashlib
+
     if df.empty or len(df) < 24:
         return pd.DataFrame(columns=["Hour", "Prophet Predicted"])
 
     try:
         from prophet import Prophet
 
-        # Prepare data for Prophet (requires 'ds' and 'y' columns)
-        prophet_df = df[["Timestamp", "Ontario Demand"]].copy()
-        prophet_df = prophet_df.dropna()
-        prophet_df = prophet_df.rename(columns={"Timestamp": "ds", "Ontario Demand": "y"})
+        # Create a hash of the data to detect changes
+        data_hash = hashlib.md5(pd.util.hash_pandas_object(df).values).hexdigest()
 
-        if len(prophet_df) < 24:
-            return pd.DataFrame(columns=["Hour", "Prophet Predicted"])
-
-        # Fit Prophet model
-        model = Prophet(
-            daily_seasonality=True,
-            weekly_seasonality=True,
-            yearly_seasonality=True,
-            changepoint_prior_scale=0.05,
+        # Check if we need to retrain (cache invalidation)
+        cache_duration = 300  # 5 minutes cache
+        current_time = time.time()
+        needs_retrain = (
+            st.session_state.prophet_model is None or
+            st.session_state.forecast_cache_data_hash != data_hash or
+            current_time - st.session_state.forecast_cache_time > cache_duration
         )
-        model.fit(prophet_df)
+
+        if needs_retrain:
+            # Prepare data for Prophet (requires 'ds' and 'y' columns)
+            prophet_df = df[["Timestamp", "Ontario Demand"]].copy()
+            prophet_df = prophet_df.dropna()
+            prophet_df = prophet_df.rename(columns={"Timestamp": "ds", "Ontario Demand": "y"})
+
+            if len(prophet_df) < 24:
+                return pd.DataFrame(columns=["Hour", "Prophet Predicted"])
+
+            # Fit Prophet model
+            model = Prophet(
+                daily_seasonality='auto',
+                weekly_seasonality='auto',
+                yearly_seasonality='auto',
+                changepoint_prior_scale=0.05,
+            )
+            model.fit(prophet_df)
+
+            # Cache the model
+            st.session_state.prophet_model = model
+            st.session_state.forecast_cache_data_hash = data_hash
+            st.session_state.forecast_cache_time = current_time
+        else:
+            model = st.session_state.prophet_model
 
         # Generate forecast for target date
         if target_date is None:
@@ -356,13 +388,28 @@ def forecast_with_prophet(df, target_date=None):
 def forecast_with_xgboost(df, target_date=None):
     """
     Use XGBoost with engineered features to predict expected demand.
+    Uses caching to avoid retraining on every refresh.
     Returns a DataFrame with Hour and XGBoost Predicted columns.
     """
+    import hashlib
+
     if df.empty or len(df) < 48:
         return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
 
     try:
         from xgboost import XGBRegressor
+
+        # Create a hash of the data to detect changes
+        data_hash = hashlib.md5(pd.util.hash_pandas_object(df).values).hexdigest()
+
+        # Check if we need to retrain (cache invalidation)
+        cache_duration = 300  # 5 minutes cache
+        current_time = time.time()
+        needs_retrain = (
+            st.session_state.xgboost_model is None or
+            st.session_state.forecast_cache_data_hash != data_hash or
+            current_time - st.session_state.forecast_cache_time > cache_duration
+        )
 
         # Feature engineering
         df_features = df.copy()
@@ -397,18 +444,28 @@ def forecast_with_xgboost(df, target_date=None):
         feature_cols = ["hour", "day_of_week", "day_of_month", "month", "is_weekend",
                         "demand_lag_1", "demand_lag_24", "rolling_mean_24", "rolling_std_24"]
 
-        X = df_features[feature_cols]
-        y = df_features["Ontario Demand"]
+        if needs_retrain:
+            X = df_features[feature_cols]
+            y = df_features["Ontario Demand"]
 
-        # Train model
-        model = XGBRegressor(
-            n_estimators=100,
-            max_depth=6,
-            learning_rate=0.1,
-            random_state=42,
-            n_jobs=-1,
-        )
-        model.fit(X, y)
+            # Train model
+            model = XGBRegressor(
+                n_estimators=100,
+                max_depth=6,
+                learning_rate=0.1,
+                random_state=42,
+                n_jobs=-1,
+            )
+            model.fit(X, y)
+
+            # Cache the model and feature data
+            st.session_state.xgboost_model = model
+            st.session_state.xgboost_feature_cols = feature_cols
+            st.session_state.forecast_cache_data_hash = data_hash
+            st.session_state.forecast_cache_time = current_time
+        else:
+            model = st.session_state.xgboost_model
+            feature_cols = st.session_state.xgboost_feature_cols
 
         # Predict for target date
         if target_date is None:

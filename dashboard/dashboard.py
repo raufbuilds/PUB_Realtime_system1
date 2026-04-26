@@ -19,12 +19,12 @@ MAX_BUFFER_SIZE = 20000
 
 
 st.set_page_config(
-    page_title="PUB Real-Time Demand Dashboard",
+    page_title="Real-Time Electricity Demand Dashboard",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("PUB Real-Time Demand Dashboard")
+st.title("Real-Time Electricity Demand Dashboard")
 st.caption(f"Connected to {BASE_URL}")
 
 
@@ -299,6 +299,185 @@ def compute_hourly_baseline(df, threshold=3.0):
     baseline["Lower"] = baseline["Expected"] - threshold * baseline["Scale"]
     baseline["Upper"] = baseline["Expected"] + threshold * baseline["Scale"]
     return baseline
+
+
+def forecast_with_prophet(df, target_date=None):
+    """
+    Use Prophet to forecast expected demand for each hour of a target date.
+    Returns a DataFrame with Hour and Predicted columns.
+    """
+    if df.empty or len(df) < 24:
+        return pd.DataFrame(columns=["Hour", "Prophet Predicted"])
+
+    try:
+        from prophet import Prophet
+
+        # Prepare data for Prophet (requires 'ds' and 'y' columns)
+        prophet_df = df[["Timestamp", "Ontario Demand"]].copy()
+        prophet_df = prophet_df.dropna()
+        prophet_df = prophet_df.rename(columns={"Timestamp": "ds", "Ontario Demand": "y"})
+
+        if len(prophet_df) < 24:
+            return pd.DataFrame(columns=["Hour", "Prophet Predicted"])
+
+        # Fit Prophet model
+        model = Prophet(
+            daily_seasonality=True,
+            weekly_seasonality=True,
+            yearly_seasonality=True,
+            changepoint_prior_scale=0.05,
+        )
+        model.fit(prophet_df)
+
+        # Generate forecast for target date
+        if target_date is None:
+            target_date = df["Date"].max()
+
+        # Create future dataframe for 24 hours
+        future_dates = []
+        for hour in range(24):
+            future_dates.append(pd.Timestamp(target_date).replace(hour=hour))
+        future_df = pd.DataFrame({"ds": future_dates})
+
+        # Make predictions
+        forecast = model.predict(future_df)
+        result = pd.DataFrame({
+            "Hour": range(24),
+            "Prophet Predicted": forecast["yhat"].values
+        })
+        return result
+    except ImportError:
+        return pd.DataFrame(columns=["Hour", "Prophet Predicted"])
+    except Exception as e:
+        st.session_state.last_error = f"Prophet forecast error: {e}"
+        return pd.DataFrame(columns=["Hour", "Prophet Predicted"])
+
+
+def forecast_with_xgboost(df, target_date=None):
+    """
+    Use XGBoost with engineered features to predict expected demand.
+    Returns a DataFrame with Hour and XGBoost Predicted columns.
+    """
+    if df.empty or len(df) < 48:
+        return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
+
+    try:
+        from xgboost import XGBRegressor
+
+        # Feature engineering
+        df_features = df.copy()
+        df_features = df_features.dropna(subset=["Timestamp", "Ontario Demand"])
+
+        if len(df_features) < 48:
+            return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
+
+        # Create time-based features
+        df_features["hour"] = df_features["Timestamp"].dt.hour
+        df_features["day_of_week"] = df_features["Timestamp"].dt.dayofweek
+        df_features["day_of_month"] = df_features["Timestamp"].dt.day
+        df_features["month"] = df_features["Timestamp"].dt.month
+        df_features["is_weekend"] = (df_features["day_of_week"] >= 5).astype(int)
+
+        # Lag features (previous hour, same hour yesterday)
+        df_features = df_features.sort_values("Timestamp")
+        df_features["demand_lag_1"] = df_features["Ontario Demand"].shift(1)
+        df_features["demand_lag_24"] = df_features["Ontario Demand"].shift(24)
+
+        # Rolling statistics
+        df_features["rolling_mean_24"] = df_features["Ontario Demand"].rolling(24).mean()
+        df_features["rolling_std_24"] = df_features["Ontario Demand"].rolling(24).std()
+
+        # Drop rows with NaN values from lag/rolling features
+        df_features = df_features.dropna()
+
+        if len(df_features) < 24:
+            return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
+
+        # Define features
+        feature_cols = ["hour", "day_of_week", "day_of_month", "month", "is_weekend",
+                        "demand_lag_1", "demand_lag_24", "rolling_mean_24", "rolling_std_24"]
+
+        X = df_features[feature_cols]
+        y = df_features["Ontario Demand"]
+
+        # Train model
+        model = XGBRegressor(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            random_state=42,
+            n_jobs=-1,
+        )
+        model.fit(X, y)
+
+        # Predict for target date
+        if target_date is None:
+            target_date = df["Date"].max()
+
+        target_ts = pd.Timestamp(target_date)
+        predictions = []
+
+        for hour in range(24):
+            # Create feature vector for this hour
+            features = {
+                "hour": hour,
+                "day_of_week": target_ts.dayofweek,
+                "day_of_month": target_ts.day,
+                "month": target_ts.month,
+                "is_weekend": 1 if target_ts.dayofweek >= 5 else 0,
+                "demand_lag_1": df_features["Ontario Demand"].iloc[-1] if len(df_features) > 0 else 0,
+                "demand_lag_24": df_features[df_features["Timestamp"] < target_ts - pd.Timedelta(hours=24)]["Ontario Demand"].mean() if len(df_features) > 24 else 0,
+                "rolling_mean_24": df_features["Ontario Demand"].tail(24).mean() if len(df_features) >= 24 else 0,
+                "rolling_std_24": df_features["Ontario Demand"].tail(24).std() if len(df_features) >= 24 else 0,
+            }
+            predictions.append(features)
+
+        pred_df = pd.DataFrame(predictions)
+        pred_df = pred_df[feature_cols]
+        forecasted = model.predict(pred_df)
+
+        result = pd.DataFrame({
+            "Hour": range(24),
+            "XGBoost Predicted": forecasted
+        })
+        return result
+    except ImportError:
+        return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
+    except Exception as e:
+        st.session_state.last_error = f"XGBoost forecast error: {e}"
+        return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
+
+
+def compute_ensemble_forecast(df, target_date=None):
+    """
+    Combine Prophet and XGBoost predictions with weighted average.
+    Returns DataFrame with Hour, Prophet, XGBoost, and Ensemble columns.
+    """
+    prophet_forecast = forecast_with_prophet(df, target_date)
+    xgboost_forecast = forecast_with_xgboost(df, target_date)
+
+    if prophet_forecast.empty and xgboost_forecast.empty:
+        return pd.DataFrame(columns=["Hour", "Prophet", "XGBoost", "Ensemble"])
+
+    # Merge forecasts
+    if prophet_forecast.empty:
+        result = xgboost_forecast.rename(columns={"XGBoost Predicted": "Ensemble"})
+        result["Prophet"] = result["Ensemble"]
+        result["XGBoost"] = result["Ensemble"]
+    elif xgboost_forecast.empty:
+        result = prophet_forecast.rename(columns={"Prophet Predicted": "Ensemble"})
+        result["Prophet"] = result["Ensemble"]
+        result["XGBoost"] = result["Ensemble"]
+    else:
+        merged = pd.merge(prophet_forecast, xgboost_forecast, on="Hour", how="outer")
+        # Weighted ensemble (Prophet: 0.4, XGBoost: 0.6)
+        merged["Ensemble"] = 0.4 * merged["Prophet Predicted"] + 0.6 * merged["XGBoost Predicted"]
+        result = merged.rename(columns={
+            "Prophet Predicted": "Prophet",
+            "XGBoost Predicted": "XGBoost"
+        })
+
+    return result[["Hour", "Prophet", "XGBoost", "Ensemble"]]
 
 
 def add_baseline_to_figure(fig, baseline, hours, title_suffix=""):
@@ -584,22 +763,53 @@ def render_average(df, scope_label):
     st.plotly_chart(fig, use_container_width=True)
 
 
-def render_today_vs_average(df, scope_label):
+def render_today_vs_average(df, scope_label, baseline=None):
     latest_date = df["Date"].max()
     today_df = df[df["Date"] == latest_date].groupby("Hour", as_index=False)["Ontario Demand"].mean()
     avg_df = df.groupby("Hour", as_index=False)["Ontario Demand"].mean()
     today_df = today_df.rename(columns={"Ontario Demand": "Today"})
     avg_df = avg_df.rename(columns={"Ontario Demand": "Average"})
+
+    # Get Prophet, XGBoost, and Ensemble forecasts
+    forecast_df = compute_ensemble_forecast(df, latest_date)
+
+    # Merge all forecasts
     merged = pd.merge(today_df, avg_df, on="Hour", how="outer").sort_values("Hour")
-    melted = merged.melt(id_vars="Hour", value_vars=["Today", "Average"], var_name="Series", value_name="Demand")
+
+    if not forecast_df.empty:
+        merged = pd.merge(merged, forecast_df, on="Hour", how="outer")
+
+    # Melt for plotting
+    if not forecast_df.empty:
+        value_vars = ["Today", "Average", "Prophet", "XGBoost", "Ensemble"]
+        value_vars = [v for v in value_vars if v in merged.columns]
+    else:
+        value_vars = ["Today", "Average"]
+
+    melted = merged.melt(id_vars="Hour", value_vars=value_vars, var_name="Series", value_name="Demand")
+
+    # Define colors for each series
+    color_map = {
+        "Today": "#1f77b4",
+        "Average": "#7f7f7f",
+        "Prophet": "#ff7f0e",
+        "XGBoost": "#2ca02c",
+        "Ensemble": "#d62728"
+    }
+
     fig = px.line(
         melted,
         x="Hour",
         y="Demand",
         color="Series",
-        title=f"Today vs Average - {latest_date.date()} | {scope_label}",
+        color_discrete_map=color_map,
+        title=f"Today vs Average (with Prophet & XGBoost Forecasts) - {latest_date.date()} | {scope_label}",
         markers=True,
     )
+
+    # Add baseline band if available
+    baseline_df = baseline if baseline is not None else pd.DataFrame()
+    fig = add_baseline_to_figure(fig, baseline_df, sorted(merged["Hour"].dropna().unique()))
 
     # Highlight anomalies for the latest date
     anomalies = df[(df["Date"] == latest_date) & (df["Anomaly"])].copy()
@@ -622,7 +832,27 @@ def render_today_vs_average(df, scope_label):
             )
         )
 
+    fig.update_layout(hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
+
+    # Show forecast metrics
+    if not forecast_df.empty:
+        st.subheader("Forecast Comparison")
+        forecast_metrics = merged[["Hour", "Prophet", "XGBoost", "Ensemble"]].copy()
+        forecast_metrics = forecast_metrics.round(1)
+        st.dataframe(forecast_metrics, use_container_width=True)
+
+        # Calculate accuracy metrics
+        if "Today" in merged.columns:
+            today_vals = merged["Today"].dropna()
+            if len(today_vals) > 0:
+                st.caption("Forecast vs Actual (lower MAE is better)")
+                for method in ["Prophet", "XGBoost", "Ensemble"]:
+                    if method in merged.columns:
+                        merged_clean = merged[["Today", method]].dropna()
+                        if len(merged_clean) > 0:
+                            mae = (merged_clean["Today"] - merged_clean[method]).abs().mean()
+                            st.caption(f"{method} MAE: {mae:.1f} MW")
 
 
 def render_latest_7_days(df, scope_label):
@@ -693,7 +923,7 @@ def render_chart(df, view_mode, baseline, scope_label):
     elif view_mode == "Average":
         render_average(df, scope_label)
     elif view_mode == "Today vs Average":
-        render_today_vs_average(df, scope_label)
+        render_today_vs_average(df, scope_label, baseline=baseline)
     elif view_mode == "Latest 7 Days":
         render_latest_7_days(df, scope_label)
     elif view_mode == "Latest Records":

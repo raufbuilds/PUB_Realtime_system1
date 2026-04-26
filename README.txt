@@ -1,5 +1,5 @@
 =====================================================
-PUB REAL-TIME DEMAND DASHBOARD - SETUP GUIDE
+Real-Time Electricity Demand Dashboard - SETUP GUIDE
 =====================================================
 
 PREREQUISITES:

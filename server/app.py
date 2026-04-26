@@ -40,17 +40,44 @@ def fetch_rows(after_id: int = 0, limit: Optional[int] = None):
     return rows
 
 
+def fetch_latest_progress():
+    conn = sqlite3.connect("data.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, date, hour, demand FROM demand "
+        "ORDER BY date DESC, hour DESC, id DESC LIMIT 1"
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+
 @app.post("/ingest")
 async def ingest(data: dict):
+    date_value = data.get("Date")
+    hour_value = data.get("Hour")
+    demand_value = data.get("Ontario Demand")
+
     conn = sqlite3.connect("data.db")
     curr = conn.cursor()
     curr.execute(
+        "SELECT id FROM demand WHERE date = ? AND hour = ? LIMIT 1",
+        (date_value, hour_value),
+    )
+    existing = curr.fetchone()
+
+    if existing:
+        conn.close()
+        return {"status": "skipped", "reason": "duplicate", "id": existing[0]}
+
+    curr.execute(
         "INSERT INTO demand (date, hour, demand) VALUES (?,?,?)",
-        (data.get("Date"), data.get("Hour"), data.get("Ontario Demand")),
+        (date_value, hour_value, demand_value),
     )
     conn.commit()
+    inserted_id = curr.lastrowid
     conn.close()
-    return {"status": "saved"}
+    return {"status": "saved", "id": inserted_id}
 
 
 @app.get("/records")
@@ -68,6 +95,20 @@ async def records(
         }
         for row in rows
     ]
+
+
+@app.get("/latest")
+async def latest():
+    row = fetch_latest_progress()
+    if row is None:
+        return {"id": None, "Date": None, "Hour": None, "Ontario Demand": None}
+
+    return {
+        "id": row[0],
+        "Date": row[1],
+        "Hour": row[2],
+        "Ontario Demand": row[3],
+    }
 
 
 @app.get("/stream")

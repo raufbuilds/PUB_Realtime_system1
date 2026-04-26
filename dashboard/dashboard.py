@@ -6,6 +6,7 @@ from queue import Empty, Full, Queue
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 
@@ -42,6 +43,58 @@ def ensure_state():
         st.session_state.last_error = None
     if "selected_anomaly_id" not in st.session_state:
         st.session_state.selected_anomaly_id = None
+    if "last_received_epoch" not in st.session_state:
+        st.session_state.last_received_epoch = None
+    if "last_received_record" not in st.session_state:
+        st.session_state.last_received_record = None
+    if "refresh_seconds" not in st.session_state:
+        st.session_state.refresh_seconds = 2
+    if "auto_refresh_enabled" not in st.session_state:
+        st.session_state.auto_refresh_enabled = True
+    if "scope" not in st.session_state:
+        st.session_state.scope = "Today"
+    if "date_range" not in st.session_state:
+        st.session_state.date_range = None
+    if "hour_range" not in st.session_state:
+        st.session_state.hour_range = (0, 23)
+    if "show_normal_rows" not in st.session_state:
+        st.session_state.show_normal_rows = False
+    if "view_mode" not in st.session_state:
+        st.session_state.view_mode = "Today"
+
+
+def coerce_date_range_value(value):
+    if isinstance(value, (list, tuple)):
+        if len(value) >= 2:
+            start = pd.to_datetime(value[0]).date()
+            end = pd.to_datetime(value[1]).date()
+        elif len(value) == 1:
+            start = end = pd.to_datetime(value[0]).date()
+        else:
+            return None
+    elif value is not None:
+        start = end = pd.to_datetime(value).date()
+    else:
+        return None
+
+    if start > end:
+        start, end = end, start
+    return (start, end)
+
+
+def clamp_date_range(date_range, min_date, max_date):
+    normalized = coerce_date_range_value(date_range)
+    if normalized is None:
+        return (min_date, max_date)
+
+    start, end = normalized
+    if start < min_date:
+        start = min_date
+    if end > max_date:
+        end = max_date
+    if start > end:
+        start, end = min_date, max_date
+    return (start, end)
 
 
 def normalize_record(raw):
@@ -169,6 +222,8 @@ def drain_queue():
             break
         if add_record(raw):
             changed = True
+            st.session_state.last_received_epoch = time.time()
+            st.session_state.last_received_record = raw
     return changed
 
 
@@ -216,9 +271,164 @@ def calculate_anomalies(df):
     return df
 
 
+def compute_hourly_baseline(df, threshold=3.0):
+    if df.empty:
+        return pd.DataFrame(columns=["Hour", "Expected", "Scale", "Lower", "Upper"])
+
+    expected = df.groupby("Hour")["Ontario Demand"].median()
+
+    def mad(series: pd.Series) -> float:
+        med = series.median()
+        return float((series - med).abs().median())
+
+    hour_mad = df.groupby("Hour")["Ontario Demand"].apply(mad)
+
+    global_mad = float((df["Ontario Demand"] - df["Ontario Demand"].median()).abs().median())
+    global_std = float(df["Ontario Demand"].std()) if pd.notna(df["Ontario Demand"].std()) else 0.0
+    fallback_scale = max([v for v in [global_mad * 1.4826, global_std] if v and v > 0] or [1.0])
+
+    scale = (hour_mad * 1.4826).replace(0, fallback_scale).fillna(fallback_scale)
+
+    baseline = pd.DataFrame(
+        {
+            "Hour": expected.index.astype(int),
+            "Expected": expected.values.astype(float),
+            "Scale": scale.reindex(expected.index).values.astype(float),
+        }
+    )
+    baseline["Lower"] = baseline["Expected"] - threshold * baseline["Scale"]
+    baseline["Upper"] = baseline["Expected"] + threshold * baseline["Scale"]
+    return baseline
+
+
+def add_baseline_to_figure(fig, baseline, hours, title_suffix=""):
+    if baseline.empty:
+        return fig
+
+    band = baseline[baseline["Hour"].isin(hours)].sort_values("Hour")
+    if band.empty:
+        return fig
+
+    fig.add_trace(
+        go.Scatter(
+            x=band["Hour"],
+            y=band["Upper"],
+            mode="lines",
+            line=dict(color="rgba(160,160,160,0.35)"),
+            name="Expected + band",
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=band["Hour"],
+            y=band["Lower"],
+            mode="lines",
+            line=dict(color="rgba(160,160,160,0.35)"),
+            fill="tonexty",
+            fillcolor="rgba(160,160,160,0.15)",
+            name="Expected band",
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=band["Hour"],
+            y=band["Expected"],
+            mode="lines",
+            line=dict(color="rgba(90,90,90,0.85)", dash="dot"),
+            name="Expected (median)",
+        )
+    )
+
+    if title_suffix:
+        fig.update_layout(title=f"{fig.layout.title.text}{title_suffix}")
+    return fig
+
+
+def add_anomaly_markers(fig, df_with_anomaly, label_col=None):
+    anomalies = df_with_anomaly[df_with_anomaly["Anomaly"]].copy()
+    if anomalies.empty:
+        return fig
+
+    hover_text = None
+    if label_col and label_col in anomalies.columns:
+        hover_text = anomalies[label_col]
+
+    fig.add_trace(
+        go.Scatter(
+            x=anomalies["Hour"],
+            y=anomalies["Ontario Demand"],
+            mode="markers",
+            marker=dict(size=11, color="#d62728", symbol="x"),
+            name="Anomaly",
+            text=hover_text,
+            customdata=anomalies[["Expected Demand", "Deviation", "Anomaly Score"]].to_numpy(),
+            hovertemplate=(
+                "Hour: %{x}<br>"
+                "Demand: %{y:.1f} MW<br>"
+                "Expected: %{customdata[0]:.1f} MW<br>"
+                "Deviation: %{customdata[1]:.1f} MW<br>"
+                "Score: %{customdata[2]:.2f}<extra></extra>"
+            ),
+        )
+    )
+    return fig
+
+
 def sidebar_controls(df):
     st.sidebar.header("Controls")
-    refresh_seconds = st.sidebar.slider("Dashboard refresh interval (seconds)", 1, 10, 2)
+    refresh_seconds = st.sidebar.slider(
+        "Dashboard refresh interval (seconds)",
+        1,
+        10,
+        key="refresh_seconds",
+    )
+    auto_refresh_enabled = st.sidebar.checkbox(
+        "Auto refresh",
+        key="auto_refresh_enabled",
+    )
+    if st.sidebar.button("Refresh now", key="refresh_now"):
+        st.rerun()
+
+    st.sidebar.subheader("Scope")
+    scope = st.sidebar.selectbox(
+        "Data scope",
+        ["All data", "Today", "Last 7 days", "Custom date range"],
+        key="scope",
+    )
+
+    if not df.empty:
+        min_date = df["Date"].min().date()
+        max_date = df["Date"].max().date()
+    else:
+        today = pd.Timestamp.today().date()
+        min_date, max_date = today, today
+
+    st.session_state.date_range = clamp_date_range(
+        st.session_state.date_range,
+        min_date,
+        max_date,
+    )
+
+    date_range = st.session_state.date_range
+    if scope == "Custom date range":
+        date_range = st.sidebar.date_input(
+            "Date range",
+            value=st.session_state.date_range,
+            min_value=min_date,
+            max_value=max_date,
+            key="date_range",
+        )
+        st.session_state.date_range = clamp_date_range(date_range, min_date, max_date)
+        date_range = st.session_state.date_range
+
+    st.sidebar.subheader("Filters")
+    hour_range = st.sidebar.slider("Hour range", 0, 23, key="hour_range")
+    show_normal_rows = st.sidebar.checkbox("Show normal rows", key="show_normal_rows")
+
     st.sidebar.caption(f"History buffer: {len(st.session_state.records)} records")
     st.sidebar.caption(
         f"Connection: {'Streaming' if st.session_state.stream_thread and st.session_state.stream_thread.is_alive() else 'Starting'}"
@@ -230,8 +440,15 @@ def sidebar_controls(df):
     if not df.empty:
         latest_date = df["Date"].max().date()
         earliest_date = df["Date"].min().date()
-        st.sidebar.caption(f"Date range: {earliest_date} to {latest_date}")
+        st.sidebar.caption(f"Available dates: {earliest_date} to {latest_date}")
 
+    if st.session_state.last_received_epoch is None:
+        st.sidebar.caption("Last update: N/A")
+    else:
+        age_s = max(0.0, time.time() - st.session_state.last_received_epoch)
+        st.sidebar.caption(f"Last update: {age_s:.0f}s ago")
+
+    st.sidebar.subheader("View")
     view = st.sidebar.selectbox(
         "View Mode",
         [
@@ -242,22 +459,84 @@ def sidebar_controls(df):
             "Latest 7 Days",
             "Latest Records",
         ],
+        key="view_mode",
     )
 
-    return view, refresh_seconds
+    return (
+        view,
+        refresh_seconds,
+        auto_refresh_enabled,
+        scope,
+        date_range,
+        hour_range,
+        show_normal_rows,
+    )
+
+
+def apply_scope_and_filters(df, scope, date_range, hour_range):
+    if df.empty:
+        return df
+
+    df_view = df.copy()
+
+    if scope == "Today":
+        latest_date = df_view["Date"].max()
+        df_view = df_view[df_view["Date"] == latest_date]
+    elif scope == "Last 7 days":
+        latest_date = df_view["Date"].max()
+        cutoff = latest_date - pd.Timedelta(days=6)
+        df_view = df_view[df_view["Date"] >= cutoff]
+    elif scope == "Custom date range":
+        start = None
+        end = None
+        if isinstance(date_range, (list, tuple)):
+            if len(date_range) >= 2:
+                start, end = date_range[0], date_range[1]
+            elif len(date_range) == 1:
+                start = end = date_range[0]
+        elif date_range is not None:
+            start = end = date_range
+
+        if start is not None and end is not None:
+            start_ts = pd.to_datetime(start)
+            end_ts = pd.to_datetime(end)
+            if start_ts > end_ts:
+                start_ts, end_ts = end_ts, start_ts
+            df_view = df_view[(df_view["Date"] >= start_ts) & (df_view["Date"] <= end_ts)]
+
+    hr0, hr1 = hour_range
+    df_view = df_view[(df_view["Hour"] >= hr0) & (df_view["Hour"] <= hr1)]
+    return df_view
+
+
+def build_scope_label(df_view, scope, hour_range):
+    hour_label = f"Hours {hour_range[0]}-{hour_range[1]}"
+    if df_view.empty:
+        return f"{scope} | {hour_label}"
+
+    min_date = df_view["Date"].min().date()
+    max_date = df_view["Date"].max().date()
+
+    if scope == "Today":
+        scope_label = f"Today ({max_date})"
+    elif scope == "Last 7 days":
+        scope_label = f"Last 7 days ({min_date} to {max_date})"
+    elif scope == "Custom date range":
+        scope_label = f"Custom range ({min_date} to {max_date})"
+    else:
+        scope_label = f"All data ({min_date} to {max_date})"
+
+    return f"{scope_label} | {hour_label}"
 
 
 def render_metrics(df):
     peak = df["Ontario Demand"].max()
     avg = df["Ontario Demand"].mean()
-    latest_hour = df["Hour"].max()
-    latest_date = df["Date"].max()
 
-    cols = st.columns(4)
+    cols = st.columns(3)
     cols[0].metric("Peak Demand", f"{peak:.0f} MW" if pd.notna(peak) else "N/A")
     cols[1].metric("Avg Demand", f"{avg:.0f} MW" if pd.notna(avg) else "N/A")
     cols[2].metric("Total Records", f"{len(df)}")
-    cols[3].metric("Latest Hour", f"{int(latest_hour)}" if pd.notna(latest_hour) else "N/A")
 
     if df["Anomaly"].any():
         st.warning(f"{int(df['Anomaly'].sum())} anomalies detected")
@@ -265,7 +544,7 @@ def render_metrics(df):
         st.success("System normal")
 
 
-def render_today(df):
+def render_today(df, scope_label, baseline=None):
     latest_date = df["Date"].max()
     df_today = df[df["Date"] == latest_date]
 
@@ -277,31 +556,35 @@ def render_today(df):
         df_today,
         x="Hour",
         y="Ontario Demand",
-        title=f"Ontario Demand - {latest_date.date()}",
+        title=f"Ontario Demand - {latest_date.date()} | {scope_label}",
         markers=True,
     )
+    baseline_df = baseline if baseline is not None else pd.DataFrame()
+    fig = add_baseline_to_figure(fig, baseline_df, sorted(df_today["Hour"].unique()))
+    fig = add_anomaly_markers(fig, df_today)
+    fig.update_layout(hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
 
-def render_all_dates(df):
+def render_all_dates(df, scope_label):
     fig = px.line(
         df,
         x="Hour",
         y="Ontario Demand",
         color="Date Label",
-        title="All Dates",
+        title=f"All Dates | {scope_label}",
         markers=True,
     )
     st.plotly_chart(fig, use_container_width=True)
 
 
-def render_average(df):
+def render_average(df, scope_label):
     df_avg = df.groupby("Hour", as_index=False)["Ontario Demand"].mean()
-    fig = px.line(df_avg, x="Hour", y="Ontario Demand", title="Average Demand", markers=True)
+    fig = px.line(df_avg, x="Hour", y="Ontario Demand", title=f"Average Demand | {scope_label}", markers=True)
     st.plotly_chart(fig, use_container_width=True)
 
 
-def render_today_vs_average(df):
+def render_today_vs_average(df, scope_label):
     latest_date = df["Date"].max()
     today_df = df[df["Date"] == latest_date].groupby("Hour", as_index=False)["Ontario Demand"].mean()
     avg_df = df.groupby("Hour", as_index=False)["Ontario Demand"].mean()
@@ -309,21 +592,57 @@ def render_today_vs_average(df):
     avg_df = avg_df.rename(columns={"Ontario Demand": "Average"})
     merged = pd.merge(today_df, avg_df, on="Hour", how="outer").sort_values("Hour")
     melted = merged.melt(id_vars="Hour", value_vars=["Today", "Average"], var_name="Series", value_name="Demand")
-    fig = px.line(melted, x="Hour", y="Demand", color="Series", title=f"Today vs Average - {latest_date.date()}", markers=True)
+    fig = px.line(
+        melted,
+        x="Hour",
+        y="Demand",
+        color="Series",
+        title=f"Today vs Average - {latest_date.date()} | {scope_label}",
+        markers=True,
+    )
+
+    # Highlight anomalies for the latest date
+    anomalies = df[(df["Date"] == latest_date) & (df["Anomaly"])].copy()
+    if not anomalies.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=anomalies["Hour"],
+                y=anomalies["Ontario Demand"],
+                mode="markers",
+                marker=dict(size=11, color="#d62728", symbol="x"),
+                name="Anomaly",
+                customdata=anomalies[["Expected Demand", "Deviation", "Anomaly Score"]].to_numpy(),
+                hovertemplate=(
+                    "Hour: %{x}<br>"
+                    "Demand: %{y:.1f} MW<br>"
+                    "Expected: %{customdata[0]:.1f} MW<br>"
+                    "Deviation: %{customdata[1]:.1f} MW<br>"
+                    "Score: %{customdata[2]:.2f}<extra></extra>"
+                ),
+            )
+        )
+
     st.plotly_chart(fig, use_container_width=True)
 
 
-def render_latest_7_days(df):
+def render_latest_7_days(df, scope_label):
     dates = sorted(df["Date"].dt.normalize().dropna().unique())[-7:]
     recent_df = df[df["Date"].isin(dates)]
     if recent_df.empty:
         st.info("Not enough recent data yet")
         return
-    fig = px.line(recent_df, x="Hour", y="Ontario Demand", color="Date Label", title="Latest 7 Dates", markers=True)
+    fig = px.line(
+        recent_df,
+        x="Hour",
+        y="Ontario Demand",
+        color="Date Label",
+        title=f"Latest 7 Dates | {scope_label}",
+        markers=True,
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 
-def render_latest_records(df):
+def render_latest_records(df, scope_label):
     recent = df.tail(50).copy()
     if recent.empty:
         st.info("No recent records available")
@@ -334,16 +653,16 @@ def render_latest_records(df):
         x="Label",
         y="Ontario Demand",
         color="Status",
-        title="Latest Records",
+        title=f"Latest Records | {scope_label}",
         hover_data=["Hour", "Deviation", "Anomaly Score"],
     )
     fig.update_layout(xaxis_tickangle=-45)
     st.plotly_chart(fig, use_container_width=True)
 
 
-def render_anomaly_details(df):
+def render_anomaly_details(df, scope_label):
     anomaly_df = df[df["Anomaly"]].copy()
-    st.subheader("Anomaly Details")
+    st.subheader(f"Anomaly Details - {scope_label}")
 
     if anomaly_df.empty:
         st.success("System normal - no anomaly markers were detected")
@@ -366,19 +685,84 @@ def render_anomaly_details(df):
     )
 
 
-def render_chart(df, view_mode):
+def render_chart(df, view_mode, baseline, scope_label):
     if view_mode == "Today":
-        render_today(df)
+        render_today(df, scope_label, baseline=baseline)
     elif view_mode == "All Dates":
-        render_all_dates(df)
+        render_all_dates(df, scope_label)
     elif view_mode == "Average":
-        render_average(df)
+        render_average(df, scope_label)
     elif view_mode == "Today vs Average":
-        render_today_vs_average(df)
+        render_today_vs_average(df, scope_label)
     elif view_mode == "Latest 7 Days":
-        render_latest_7_days(df)
+        render_latest_7_days(df, scope_label)
     elif view_mode == "Latest Records":
-        render_latest_records(df)
+        render_latest_records(df, scope_label)
+
+
+def render_dashboard_content(view, scope, date_range, hour_range, show_normal_rows):
+    queue_changed = drain_queue()
+    df = dataframe_from_state()
+    if not df.empty:
+        df = calculate_anomalies(df)
+
+    if queue_changed:
+        st.session_state.last_error = None
+
+    if df.empty:
+        st.info("Waiting for data from the server...")
+        return
+
+    baseline = compute_hourly_baseline(df)
+    df_view = apply_scope_and_filters(df, scope, date_range, hour_range)
+    scope_label = build_scope_label(df_view, scope, hour_range)
+
+    if df_view.empty:
+        st.warning(f"No data matches the selected scope/filters. Active view: {scope_label}")
+    else:
+        render_metrics(df_view)
+        st.caption(f"Active scope: {scope_label}")
+        render_chart(df_view, view, baseline, scope_label)
+
+        st.divider()
+        render_anomaly_details(df_view, scope_label)
+
+    df_table = df_view
+    if not show_normal_rows:
+        df_table = df_table[df_table["Anomaly"]]
+
+    table_scope_label = build_scope_label(df_view, scope, hour_range)
+    st.subheader(f"Latest Records - {table_scope_label}")
+
+    if df_table.empty:
+        if show_normal_rows:
+            st.info(f"No records available for {table_scope_label}.")
+        else:
+            st.info(f"No anomaly rows available for {table_scope_label}. Turn on 'Show normal rows' to see all records.")
+
+    st.dataframe(
+        df_table[
+            [
+                "Date",
+                "Hour",
+                "Ontario Demand",
+                "Expected Demand",
+                "Deviation",
+                "Anomaly Score",
+                "Status",
+            ]
+        ].tail(25),
+        use_container_width=True,
+    )
+
+    st.download_button(
+        f"Download current view ({scope_label})",
+        data=df_view.to_csv(index=False).encode("utf-8"),
+        file_name="pub_dashboard_view.csv",
+        mime="text/csv",
+        key="download_current_view",
+        on_click="ignore",
+    )
 
 
 ensure_state()
@@ -394,37 +778,26 @@ if st.session_state.stream_thread is None or not st.session_state.stream_thread.
     )
     st.session_state.stream_thread.start()
 
-queue_changed = drain_queue()
-df = dataframe_from_state()
-if not df.empty:
-    df = calculate_anomalies(df)
+df_sidebar = dataframe_from_state()
+(
+    view,
+    refresh_seconds,
+    auto_refresh_enabled,
+    scope,
+    date_range,
+    hour_range,
+    show_normal_rows,
+) = sidebar_controls(df_sidebar)
 
-view, refresh_seconds = sidebar_controls(df)
+if hasattr(st, "fragment"):
+    @st.fragment(run_every=refresh_seconds if auto_refresh_enabled else None)
+    def live_dashboard():
+        render_dashboard_content(view, scope, date_range, hour_range, show_normal_rows)
 
-if queue_changed:
-    st.session_state.last_error = None
 
-if df.empty:
-    st.info("Waiting for data from the server...")
+    live_dashboard()
 else:
-    render_metrics(df)
-    render_chart(df, view)
-    render_anomaly_details(df)
-    st.subheader("Latest Records")
-    st.dataframe(
-        df[
-            [
-                "Date",
-                "Hour",
-                "Ontario Demand",
-                "Expected Demand",
-                "Deviation",
-                "Anomaly Score",
-                "Status",
-            ]
-        ].tail(25),
-        use_container_width=True,
-    )
-
-time.sleep(refresh_seconds)
-st.rerun()
+    render_dashboard_content(view, scope, date_range, hour_range, show_normal_rows)
+    if auto_refresh_enabled:
+        time.sleep(refresh_seconds)
+        st.rerun()

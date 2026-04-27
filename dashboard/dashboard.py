@@ -3,6 +3,7 @@ import os
 import threading
 import time
 from queue import Empty, Full, Queue
+from typing import Any
 
 import pandas as pd
 import plotly.express as px
@@ -16,6 +17,7 @@ BASE_URL = f"http://{SERVER_IP}:8000"
 STREAM_URL = f"{BASE_URL}/stream"
 RECORDS_URL = f"{BASE_URL}/records"
 MAX_BUFFER_SIZE = 20000
+FORECAST_REFRESH_SECONDS = int(os.getenv("FORECAST_REFRESH_SECONDS", "300"))
 
 
 st.set_page_config(
@@ -61,6 +63,13 @@ def ensure_state():
         st.session_state.show_normal_rows = False
     if "view_mode" not in st.session_state:
         st.session_state.view_mode = "Today"
+    elif st.session_state.view_mode == "Today vs Average":
+        st.session_state.view_mode = "Today vs Forecast Benchmarks"
+    elif st.session_state.view_mode in {
+        "Today vs Forecast Benchmarks",
+        "Today vs Live-Trained Forecast",
+    }:
+        st.session_state.view_mode = "Forecast Training Comparison"
     # Forecast model caching
     if "prophet_model" not in st.session_state:
         st.session_state.prophet_model = None
@@ -70,6 +79,14 @@ def ensure_state():
         st.session_state.forecast_cache_time = 0
     if "forecast_cache_data_hash" not in st.session_state:
         st.session_state.forecast_cache_data_hash = None
+    if "forecast_cache_result" not in st.session_state:
+        st.session_state.forecast_cache_result = None
+    if "forecast_cache_target_date" not in st.session_state:
+        st.session_state.forecast_cache_target_date = None
+    if "forecast_cache_include_today" not in st.session_state:
+        st.session_state.forecast_cache_include_today = None
+    if "forecast_cache_results" not in st.session_state:
+        st.session_state.forecast_cache_results = {}
 
 
 def coerce_date_range_value(value):
@@ -310,56 +327,68 @@ def compute_hourly_baseline(df, threshold=3.0):
     return baseline
 
 
+def forecast_training_frame(df, target_date=None, include_target_date=False):
+    if df.empty:
+        return df
+
+    if target_date is None:
+        target_date = df["Date"].max()
+
+    if include_target_date:
+        return df.copy()
+
+    historical_df = df[df["Date"] < pd.Timestamp(target_date)].copy()
+    if len(historical_df) >= 48:
+        return historical_df
+
+    return df.copy()
+
+
+def forecast_cache_signature(df, target_date=None, include_target_date=False):
+    if df.empty:
+        return (0, None, None, None, include_target_date)
+
+    if target_date is None:
+        target_date = df["Date"].max()
+
+    latest_ts = df["Timestamp"].max() if "Timestamp" in df.columns else None
+    earliest_ts = df["Timestamp"].min() if "Timestamp" in df.columns else None
+    return (
+        len(df),
+        pd.Timestamp(earliest_ts).isoformat() if pd.notna(earliest_ts) else None,
+        pd.Timestamp(latest_ts).isoformat() if pd.notna(latest_ts) else None,
+        pd.Timestamp(target_date).date().isoformat(),
+        include_target_date,
+    )
+
+
 def forecast_with_prophet(df, target_date=None):
     """
     Use Prophet to forecast expected demand for each hour of a target date.
-    Uses caching to avoid retraining on every refresh.
     Returns a DataFrame with Hour and Predicted columns.
     """
-    import hashlib
-
     if df.empty or len(df) < 24:
         return pd.DataFrame(columns=["Hour", "Prophet Predicted"])
 
     try:
         from prophet import Prophet
 
-        # Create a hash of the data to detect changes
-        data_hash = hashlib.md5(pd.util.hash_pandas_object(df).values).hexdigest()
+        # Prepare data for Prophet (requires 'ds' and 'y' columns)
+        prophet_df = df[["Timestamp", "Ontario Demand"]].copy()
+        prophet_df = prophet_df.dropna()
+        prophet_df = prophet_df.rename(columns={"Timestamp": "ds", "Ontario Demand": "y"})
 
-        # Check if we need to retrain (cache invalidation)
-        cache_duration = 300  # 5 minutes cache
-        current_time = time.time()
-        needs_retrain = (
-            st.session_state.prophet_model is None or
-            st.session_state.forecast_cache_data_hash != data_hash or
-            current_time - st.session_state.forecast_cache_time > cache_duration
+        if len(prophet_df) < 24:
+            return pd.DataFrame(columns=["Hour", "Prophet Predicted"])
+
+        # Fit Prophet model
+        model = Prophet(
+            daily_seasonality='auto',
+            weekly_seasonality='auto',
+            yearly_seasonality='auto',
+            changepoint_prior_scale=0.05,
         )
-
-        if needs_retrain:
-            # Prepare data for Prophet (requires 'ds' and 'y' columns)
-            prophet_df = df[["Timestamp", "Ontario Demand"]].copy()
-            prophet_df = prophet_df.dropna()
-            prophet_df = prophet_df.rename(columns={"Timestamp": "ds", "Ontario Demand": "y"})
-
-            if len(prophet_df) < 24:
-                return pd.DataFrame(columns=["Hour", "Prophet Predicted"])
-
-            # Fit Prophet model
-            model = Prophet(
-                daily_seasonality='auto',
-                weekly_seasonality='auto',
-                yearly_seasonality='auto',
-                changepoint_prior_scale=0.05,
-            )
-            model.fit(prophet_df)
-
-            # Cache the model
-            st.session_state.prophet_model = model
-            st.session_state.forecast_cache_data_hash = data_hash
-            st.session_state.forecast_cache_time = current_time
-        else:
-            model = st.session_state.prophet_model
+        model.fit(prophet_df)
 
         # Generate forecast for target date
         if target_date is None:
@@ -388,28 +417,13 @@ def forecast_with_prophet(df, target_date=None):
 def forecast_with_xgboost(df, target_date=None):
     """
     Use XGBoost with engineered features to predict expected demand.
-    Uses caching to avoid retraining on every refresh.
     Returns a DataFrame with Hour and XGBoost Predicted columns.
     """
-    import hashlib
-
     if df.empty or len(df) < 48:
         return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
 
     try:
         from xgboost import XGBRegressor
-
-        # Create a hash of the data to detect changes
-        data_hash = hashlib.md5(pd.util.hash_pandas_object(df).values).hexdigest()
-
-        # Check if we need to retrain (cache invalidation)
-        cache_duration = 300  # 5 minutes cache
-        current_time = time.time()
-        needs_retrain = (
-            st.session_state.xgboost_model is None or
-            st.session_state.forecast_cache_data_hash != data_hash or
-            current_time - st.session_state.forecast_cache_time > cache_duration
-        )
 
         # Feature engineering
         df_features = df.copy()
@@ -444,28 +458,18 @@ def forecast_with_xgboost(df, target_date=None):
         feature_cols = ["hour", "day_of_week", "day_of_month", "month", "is_weekend",
                         "demand_lag_1", "demand_lag_24", "rolling_mean_24", "rolling_std_24"]
 
-        if needs_retrain:
-            X = df_features[feature_cols]
-            y = df_features["Ontario Demand"]
+        X = df_features[feature_cols]
+        y = df_features["Ontario Demand"]
 
-            # Train model
-            model = XGBRegressor(
-                n_estimators=100,
-                max_depth=6,
-                learning_rate=0.1,
-                random_state=42,
-                n_jobs=-1,
-            )
-            model.fit(X, y)
-
-            # Cache the model and feature data
-            st.session_state.xgboost_model = model
-            st.session_state.xgboost_feature_cols = feature_cols
-            st.session_state.forecast_cache_data_hash = data_hash
-            st.session_state.forecast_cache_time = current_time
-        else:
-            model = st.session_state.xgboost_model
-            feature_cols = st.session_state.xgboost_feature_cols
+        # Train model
+        model = XGBRegressor(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            random_state=42,
+            n_jobs=-1,
+        )
+        model.fit(X, y)
 
         # Predict for target date
         if target_date is None:
@@ -505,13 +509,26 @@ def forecast_with_xgboost(df, target_date=None):
         return pd.DataFrame(columns=["Hour", "XGBoost Predicted"])
 
 
-def compute_ensemble_forecast(df, target_date=None):
+def compute_ensemble_forecast(df, target_date=None, include_target_date=False):
     """
     Combine Prophet and XGBoost predictions with weighted average.
     Returns DataFrame with Hour, Prophet, XGBoost, and Ensemble columns.
     """
-    prophet_forecast = forecast_with_prophet(df, target_date)
-    xgboost_forecast = forecast_with_xgboost(df, target_date)
+    training_df = forecast_training_frame(df, target_date, include_target_date)
+    target_date_value = pd.Timestamp(target_date or df["Date"].max()).date()
+    signature = forecast_cache_signature(training_df, target_date_value, include_target_date)
+    cache_key = (target_date_value.isoformat(), include_target_date)
+    cached = st.session_state.forecast_cache_results.get(cache_key)
+
+    if (
+        cached is not None
+        and cached["signature"] == signature
+        and time.time() - cached["created_at"] < FORECAST_REFRESH_SECONDS
+    ):
+        return cached["result"].copy()
+
+    prophet_forecast = forecast_with_prophet(training_df, target_date)
+    xgboost_forecast = forecast_with_xgboost(training_df, target_date)
 
     if prophet_forecast.empty and xgboost_forecast.empty:
         return pd.DataFrame(columns=["Hour", "Prophet", "XGBoost", "Ensemble"])
@@ -534,7 +551,18 @@ def compute_ensemble_forecast(df, target_date=None):
             "XGBoost Predicted": "XGBoost"
         })
 
-    return result[["Hour", "Prophet", "XGBoost", "Ensemble"]]
+    result = result[["Hour", "Prophet", "XGBoost", "Ensemble"]]
+    st.session_state.forecast_cache_result = result.copy()
+    st.session_state.forecast_cache_data_hash = signature
+    st.session_state.forecast_cache_target_date = target_date_value
+    st.session_state.forecast_cache_include_today = include_target_date
+    st.session_state.forecast_cache_time = time.time()
+    st.session_state.forecast_cache_results[cache_key] = {
+        "created_at": st.session_state.forecast_cache_time,
+        "signature": signature,
+        "result": result.copy(),
+    }
+    return result
 
 
 def add_baseline_to_figure(fig, baseline, hours, title_suffix=""):
@@ -691,7 +719,7 @@ def sidebar_controls(df):
             "Today",
             "All Dates",
             "Average",
-            "Today vs Average",
+            "Forecast Training Comparison",
             "Latest 7 Days",
             "Latest Records",
         ],
@@ -820,15 +848,50 @@ def render_average(df, scope_label):
     st.plotly_chart(fig, use_container_width=True)
 
 
-def render_today_vs_average(df, scope_label, baseline=None):
+def calculate_accuracy_percentage(actual, predicted):
+    comparison = pd.DataFrame({"Actual": actual, "Predicted": predicted}).dropna()
+    comparison = comparison[comparison["Actual"] != 0]
+    if comparison.empty:
+        return None
+
+    absolute_percentage_error = (
+        (comparison["Actual"] - comparison["Predicted"]).abs() / comparison["Actual"].abs()
+    )
+    accuracy = 100 - (absolute_percentage_error.mean() * 100)
+    return max(0.0, min(100.0, float(accuracy)))
+
+
+def style_today_trace(fig):
+    for trace in fig.data:
+        line_width = 5 if getattr(trace, "name", None) == "Today" else 2
+        marker_size = 9 if getattr(trace, "name", None) == "Today" else None
+        if marker_size is None:
+            trace.update(line={"width": line_width})
+        else:
+            trace.update(line={"width": line_width}, marker={"size": marker_size})
+
+
+def render_today_vs_forecast(df, scope_label, baseline=None, include_today_in_training=False):
     latest_date = df["Date"].max()
     today_df = df[df["Date"] == latest_date].groupby("Hour", as_index=False)["Ontario Demand"].mean()
-    avg_df = df.groupby("Hour", as_index=False)["Ontario Demand"].mean()
+    if include_today_in_training:
+        comparison_source = df
+        title_prefix = "Today vs Live-Trained Forecast"
+    else:
+        historical_df = df[df["Date"] < latest_date].copy()
+        comparison_source = historical_df if not historical_df.empty else df
+        title_prefix = "Today vs Forecast Benchmarks"
+
+    avg_df = comparison_source.groupby("Hour", as_index=False)["Ontario Demand"].mean()
     today_df = today_df.rename(columns={"Ontario Demand": "Today"})
     avg_df = avg_df.rename(columns={"Ontario Demand": "Average"})
 
     # Get Prophet, XGBoost, and Ensemble forecasts
-    forecast_df = compute_ensemble_forecast(df, latest_date)
+    forecast_df = compute_ensemble_forecast(
+        df,
+        latest_date,
+        include_target_date=include_today_in_training,
+    )
 
     # Merge all forecasts
     merged = pd.merge(today_df, avg_df, on="Hour", how="outer").sort_values("Hour")
@@ -836,12 +899,28 @@ def render_today_vs_average(df, scope_label, baseline=None):
     if not forecast_df.empty:
         merged = pd.merge(merged, forecast_df, on="Hour", how="outer")
 
+    baseline_df = compute_hourly_baseline(comparison_source)
+    if baseline_df.empty and baseline is not None:
+        baseline_df = baseline
+    if not baseline_df.empty:
+        expected_median = baseline_df[["Hour", "Expected"]].rename(
+            columns={"Expected": "Expected Median"}
+        )
+        merged = pd.merge(merged, expected_median, on="Hour", how="outer")
+
     # Melt for plotting
     if not forecast_df.empty:
-        value_vars = ["Today", "Average", "Prophet", "XGBoost", "Ensemble"]
+        value_vars = [
+            "Today",
+            "Average",
+            "Prophet",
+            "XGBoost",
+            "Ensemble",
+        ]
         value_vars = [v for v in value_vars if v in merged.columns]
     else:
         value_vars = ["Today", "Average"]
+        value_vars = [v for v in value_vars if v in merged.columns]
 
     melted = merged.melt(id_vars="Hour", value_vars=value_vars, var_name="Series", value_name="Demand")
 
@@ -851,7 +930,8 @@ def render_today_vs_average(df, scope_label, baseline=None):
         "Average": "#7f7f7f",
         "Prophet": "#ff7f0e",
         "XGBoost": "#2ca02c",
-        "Ensemble": "#d62728"
+        "Ensemble": "#d62728",
+        "Expected Median": "#4d4d4d",
     }
 
     fig = px.line(
@@ -860,12 +940,13 @@ def render_today_vs_average(df, scope_label, baseline=None):
         y="Demand",
         color="Series",
         color_discrete_map=color_map,
-        title=f"Today vs Average (with Prophet & XGBoost Forecasts) - {latest_date.date()} | {scope_label}",
+        title=f"{title_prefix} - {latest_date.date()} | {scope_label}",
         markers=True,
     )
 
+    style_today_trace(fig)
+
     # Add baseline band if available
-    baseline_df = baseline if baseline is not None else pd.DataFrame()
     fig = add_baseline_to_figure(fig, baseline_df, sorted(merged["Hour"].dropna().unique()))
 
     # Highlight anomalies for the latest date
@@ -892,24 +973,60 @@ def render_today_vs_average(df, scope_label, baseline=None):
     fig.update_layout(hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
-    # Show forecast metrics
-    if not forecast_df.empty:
-        st.subheader("Forecast Comparison")
-        forecast_metrics = merged[["Hour", "Prophet", "XGBoost", "Ensemble"]].copy()
-        forecast_metrics = forecast_metrics.round(1)
-        st.dataframe(forecast_metrics, use_container_width=True)
+    st.subheader("Today vs Expected Accuracy")
+    methods = ["Average", "Prophet", "XGBoost", "Ensemble", "Expected Median"]
+    accuracy_rows: list[dict[str, Any]] = []
+    for method in methods:
+        if method not in merged.columns:
+            continue
 
-        # Calculate accuracy metrics
-        if "Today" in merged.columns:
-            today_vals = merged["Today"].dropna()
-            if len(today_vals) > 0:
-                st.caption("Forecast vs Actual (lower MAE is better)")
-                for method in ["Prophet", "XGBoost", "Ensemble"]:
-                    if method in merged.columns:
-                        merged_clean = merged[["Today", method]].dropna()
-                        if len(merged_clean) > 0:
-                            mae = (merged_clean["Today"] - merged_clean[method]).abs().mean()
-                            st.caption(f"{method} MAE: {mae:.1f} MW")
+        comparison = merged[["Today", method]].dropna()
+        if comparison.empty:
+            continue
+
+        mae = (comparison["Today"] - comparison[method]).abs().mean()
+        accuracy = calculate_accuracy_percentage(comparison["Today"], comparison[method])
+        accuracy_rows.append(
+            {
+                "Method": method,
+                "Accuracy %": accuracy,
+                "MAE (MW)": mae,
+                "Compared Hours": len(comparison),
+            }
+        )
+
+    if accuracy_rows:
+        accuracy_df = pd.DataFrame(accuracy_rows)
+        accuracy_df["Accuracy %"] = accuracy_df["Accuracy %"].map(
+            lambda value: "N/A" if value is None else f"{value:.1f}%"
+        )
+        accuracy_df["MAE (MW)"] = accuracy_df["MAE (MW)"].round(1)
+        st.dataframe(accuracy_df, use_container_width=True, hide_index=True)
+
+    comparison_columns = ["Hour"] + [column for column in methods if column in merged.columns]
+    if len(comparison_columns) > 1:
+        st.subheader("Expected Demand Comparison")
+        st.dataframe(merged[comparison_columns].round(1), use_container_width=True)
+
+
+def render_forecast_training_comparison(df, scope_label, baseline=None):
+    left_col, right_col = st.columns(2)
+
+    with left_col:
+        render_today_vs_forecast(
+            df,
+            scope_label,
+            baseline=baseline,
+            include_today_in_training=False,
+        )
+
+    with right_col:
+        render_today_vs_forecast(
+            df,
+            scope_label,
+            baseline=baseline,
+            include_today_in_training=True,
+        )
 
 
 def render_latest_7_days(df, scope_label):
@@ -979,8 +1096,8 @@ def render_chart(df, view_mode, baseline, scope_label):
         render_all_dates(df, scope_label)
     elif view_mode == "Average":
         render_average(df, scope_label)
-    elif view_mode == "Today vs Average":
-        render_today_vs_average(df, scope_label, baseline=baseline)
+    elif view_mode == "Forecast Training Comparison":
+        render_forecast_training_comparison(df, scope_label, baseline=baseline)
     elif view_mode == "Latest 7 Days":
         render_latest_7_days(df, scope_label)
     elif view_mode == "Latest Records":

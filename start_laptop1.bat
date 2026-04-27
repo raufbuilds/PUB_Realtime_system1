@@ -20,8 +20,8 @@ for /f "tokens=5" %%a in ('netstat -aon ^| findstr :8000') do (
 )
 
 echo Starting FastAPI server...
-:: Added --reload so code changes apply without restarting the server
-start "FASTAPI" cmd /k "uvicorn server.app:app --host 0.0.0.0 --port 8000 --reload"
+:: Reload only when server code changes. Dashboard edits should not restart the API.
+start "FASTAPI" cmd /k "uvicorn server.app:app --host 0.0.0.0 --port 8000 --reload --reload-dir server"
 
 
 echo Starting sender...

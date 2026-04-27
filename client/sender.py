@@ -4,28 +4,82 @@ import time
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
-API_URL = "http://127.0.0.1:8000/ingest"
-LATEST_URL = "http://127.0.0.1:8000/latest"
+def load_env_file(path=".env"):
+    if not os.path.exists(path):
+        return
+
+    with open(path, "r", encoding="utf-8") as env_file:
+        for line in env_file:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_env_file()
+
+BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+API_URL = f"{BASE_URL}/ingest"
+LATEST_URL = f"{BASE_URL}/latest"
 LOG_FILE = "sent_files.txt"
+RETRY_TOTAL = int(os.getenv("CLIENT_RETRY_TOTAL", "3"))
+RETRY_BACKOFF_FACTOR = float(os.getenv("CLIENT_RETRY_BACKOFF_FACTOR", "0.5"))
+ROW_RETRY_TOTAL = int(os.getenv("CLIENT_ROW_RETRY_TOTAL", "10"))
+REQUEST_TIMEOUT = float(os.getenv("CLIENT_REQUEST_TIMEOUT", "30"))
+
+
+def create_retry_session():
+    session = requests.Session()
+    retry = Retry(
+        total=RETRY_TOTAL,
+        connect=RETRY_TOTAL,
+        read=RETRY_TOTAL,
+        status=RETRY_TOTAL,
+        backoff_factor=RETRY_BACKOFF_FACTOR,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+session = create_retry_session()
+
+
+def wait_for_server():
+    while True:
+        try:
+            response = session.get(LATEST_URL, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            return
+        except requests.RequestException as exc:
+            print(f"Waiting for API server: {exc}")
+            time.sleep(3)
 
 
 def get_processed_files():
     if not os.path.exists(LOG_FILE):
         return set()
-    with open(LOG_FILE, "r") as file_obj:
+    with open(LOG_FILE, "r", encoding="utf-8") as file_obj:
         return set(line.strip() for line in file_obj)
 
 
 def mark_as_processed(filename):
-    with open(LOG_FILE, "a") as file_obj:
+    with open(LOG_FILE, "a", encoding="utf-8") as file_obj:
         file_obj.write(filename + "\n")
 
 
 def get_latest_progress():
     try:
-        response = requests.get(LATEST_URL, timeout=10)
+        response = session.get(LATEST_URL, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         payload = response.json()
     except requests.RequestException as exc:
@@ -82,6 +136,38 @@ def filter_rows_after_progress(df, latest_progress):
     return df[mask].reset_index(drop=True)
 
 
+def send_row(row_dict, row_index):
+    for attempt in range(1, ROW_RETRY_TOTAL + 1):
+        try:
+            response = session.post(API_URL, json=row_dict, timeout=REQUEST_TIMEOUT)
+            if response.status_code != 200:
+                print(
+                    f"Row {row_index} failed with status {response.status_code} "
+                    f"(attempt {attempt}/{ROW_RETRY_TOTAL})"
+                )
+                time.sleep(min(attempt * 2, 15))
+                continue
+
+            result = response.json()
+            status = result.get("status")
+            if status == "saved":
+                print(f"Sent row {row_index} successfully")
+            elif status == "skipped":
+                print(f"Skipped row {row_index}, already exists")
+            else:
+                print(f"Processed row {row_index} with status {status}")
+            return True
+        except requests.RequestException as exc:
+            print(
+                f"Error sending row {row_index} "
+                f"(attempt {attempt}/{ROW_RETRY_TOTAL}): {exc}"
+            )
+            time.sleep(min(attempt * 2, 15))
+
+    return False
+
+
+wait_for_server()
 processed_files = get_processed_files()
 latest_progress = get_latest_progress()
 base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -141,30 +227,22 @@ else:
                 f"({format_progress(start_progress)} -> {format_progress(end_progress)})"
             )
 
+            file_successful = True
             for idx, row in df.iterrows():
-                try:
-                    row_dict = row.to_dict()
-                    row_dict["Date"] = row_dict["Date"].isoformat()  # Convert Timestamp to string
-                    response = requests.post(API_URL, json=row_dict, timeout=10)
-                    if response.status_code == 200:
-                        result = response.json()
-                        status = result.get("status")
-                        if status == "saved":
-                            print(f"Sent row {idx} successfully")
-                            latest_progress = (row["Date"], int(row["Hour"]))
-                        elif status == "skipped":
-                            print(f"Skipped row {idx}, already exists")
-                            latest_progress = (row["Date"], int(row["Hour"]))
-                        else:
-                            print(f"Processed row {idx} with status {status}")
-                    else:
-                        print(f"Row {idx} failed with status {response.status_code}")
+                row_dict = row.to_dict()
+                row_dict["Date"] = row_dict["Date"].isoformat()
+                if send_row(row_dict, idx):
+                    latest_progress = (row["Date"], int(row["Hour"]))
                     time.sleep(1)
-                except Exception as exc:
-                    print(f"Error sending row {idx}: {exc}")
+                    continue
 
-            mark_as_processed(filename)
-            print(f"Marked {filename} as processed")
+                file_successful = False
+                print(f"Stopping {filename}; row {idx} was not confirmed by the server")
+                break
+
+            if file_successful:
+                mark_as_processed(filename)
+                print(f"Marked {filename} as processed")
         except Exception as exc:
             print(f"Error reading {file_path}: {exc}")
 
